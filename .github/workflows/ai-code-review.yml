@@ -1,0 +1,76 @@
+name: AI Code Review (Copilot Gate)
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  ai-code-review:
+    name: AI Code Review (Copilot Gate)
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Wait for Copilot review
+        run: |
+          set -euo pipefail
+
+          # Guard: PR context must be available (inherited from caller's event).
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "::error::No pull_request context available (github.event.pull_request.number is empty)."
+            echo "::error::This reusable workflow must be called from a pull_request / pull_request_review triggered workflow."
+            exit 1
+          fi
+
+          POLL_INTERVAL=20
+          MAX_WAIT=480  # 8 minutes
+          ELAPSED=0
+
+          echo "🤖 Waiting for Copilot code review on PR #${PR_NUMBER}..."
+          echo ""
+
+          while true; do
+            REVIEWS_JSON=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100")
+
+            # Validate API response
+            if ! echo "$REVIEWS_JSON" | jq -e 'type == "array"' > /dev/null 2>&1; then
+              echo "::error::Failed to fetch PR reviews. API response:"
+              echo "$REVIEWS_JSON" | jq . 2>/dev/null || echo "$REVIEWS_JSON"
+              exit 1
+            fi
+
+            # Check for Copilot review: user.login matches copilot-pull-request-reviewer[bot] or copilot
+            COPILOT_REVIEW=$(echo "$REVIEWS_JSON" | jq -r '
+              [ .[] | select(.user.login == "copilot-pull-request-reviewer[bot]" or .user.login == "copilot") ]
+              | sort_by(.submitted_at) | last // empty
+            ')
+
+            if [ -n "$COPILOT_REVIEW" ] && [ "$COPILOT_REVIEW" != "null" ]; then
+              REVIEW_TIME=$(echo "$COPILOT_REVIEW" | jq -r '.submitted_at')
+              REVIEW_STATE=$(echo "$COPILOT_REVIEW" | jq -r '.state')
+              REVIEW_USER=$(echo "$COPILOT_REVIEW" | jq -r '.user.login')
+              echo "✅ Copilot review detected!"
+              echo "   Reviewer: ${REVIEW_USER}"
+              echo "   State: ${REVIEW_STATE}"
+              echo "   Submitted at: ${REVIEW_TIME}"
+              exit 0
+            fi
+
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+            if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+              echo ""
+              echo "::error::⏰ Timeout: Copilot review not detected after ${MAX_WAIT}s."
+              echo "::error::Copilot 尚未提交评审。Copilot 提交评审后会通过 pull_request_review 事件自动重跑此 workflow。"
+              exit 1
+            fi
+
+            echo "  ⏳ [${ELAPSED}s/${MAX_WAIT}s] Copilot review not yet available, retrying in ${POLL_INTERVAL}s..."
+            sleep "$POLL_INTERVAL"
+          done
