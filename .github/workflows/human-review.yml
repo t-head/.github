@@ -1,0 +1,82 @@
+name: Human Review Gate
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  human-review:
+    name: Human Review Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Wait for human approval
+        run: |
+          set -euo pipefail
+
+          # Guard: PR context must be available (inherited from caller's event).
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "::error::No pull_request context available (github.event.pull_request.number is empty)."
+            echo "::error::This reusable workflow must be called from a pull_request / pull_request_review triggered workflow."
+            exit 1
+          fi
+
+          echo "👤 Waiting for human review approval on PR #${PR_NUMBER}..."
+          echo ""
+          echo "ℹ️  Note: GitHub-hosted runners terminate a single job after ~6h."
+          echo "ℹ️  If this job is killed before approval, it does NOT weaken the gate:"
+          echo "ℹ️  a human approve fires a pull_request_review event that re-runs this"
+          echo "ℹ️  entire workflow, so the gate will still turn green upon approval."
+          echo ""
+
+          POLL_INTERVAL=60
+          MAX_WAIT=21600  # 6 hours
+          ELAPSED=0
+
+          while true; do
+            REVIEWS_JSON=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100")
+
+            # Validate API response
+            if ! echo "$REVIEWS_JSON" | jq -e 'type == "array"' > /dev/null 2>&1; then
+              echo "::error::Failed to fetch PR reviews. API response:"
+              echo "$REVIEWS_JSON" | jq . 2>/dev/null || echo "$REVIEWS_JSON"
+              exit 1
+            fi
+
+            # For each human reviewer, take their latest review; keep state==APPROVED
+            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq -r '
+              [ .[] | select(.user.type != "Bot") ]
+              | group_by(.user.login)
+              | map(sort_by(.submitted_at) | last)
+              | [ .[] | select(.state == "APPROVED") ]
+            ')
+
+            APPROVE_COUNT=$(echo "$APPROVED_HUMANS" | jq 'length')
+
+            if [ "$APPROVE_COUNT" -ge 1 ]; then
+              echo ""
+              echo "✅ Human review approval detected! (${APPROVE_COUNT} approver(s))"
+              echo "$APPROVED_HUMANS" | jq -r '.[] | "   ✓ \(.user.login) approved at \(.submitted_at)"'
+              exit 0
+            fi
+
+            if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+              echo ""
+              echo "::error::⏰ Timeout after ${MAX_WAIT}s: no human approval detected."
+              echo "::error::等待人工 review 通过。有人 approve 后会通过 pull_request_review 事件自动重跑此 workflow。"
+              exit 1
+            fi
+
+            echo "  ⏳ [已等待 ${ELAPSED}s / ${MAX_WAIT}s] 尚无真人 approve，${POLL_INTERVAL}s 后重试..."
+            sleep "$POLL_INTERVAL"
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
