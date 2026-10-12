@@ -1,0 +1,103 @@
+name: PR Issue Link Check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  pr-issue-link:
+    name: PR Issue Link Check
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Check linked issues
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "::error::No pull_request context available (github.event.pull_request.number is empty)."
+            echo "::error::This reusable workflow must be called from a pull_request / pull_request_review triggered workflow."
+            exit 1
+          fi
+
+          if [ "${PR_AUTHOR_TYPE}" = "Bot" ]; then
+            echo "🤖 PR author ${PR_AUTHOR} is a bot, skipping issue link check."
+            exit 0
+          fi
+
+          # Fetch body via API instead of event payload so re-runs see the latest description.
+          RESULT=$(gh api graphql \
+            -F owner="${REPO%%/*}" \
+            -F name="${REPO#*/}" \
+            -F number="${PR_NUMBER}" \
+            -f query='
+              query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $number) {
+                    body
+                    closingIssuesReferences(first: 20) {
+                      nodes { number title url state }
+                    }
+                  }
+                }
+              }')
+
+          LINKED=$(jq -c '.data.repository.pullRequest.closingIssuesReferences.nodes' <<<"$RESULT")
+          jq -r '.[] | select(.state != "OPEN") | "   ✗ #\(.number) \(.title) is closed, ignored"' <<<"$LINKED"
+          COUNT=$(jq '[.[] | select(.state == "OPEN")] | length' <<<"$LINKED")
+
+          if [ "${COUNT}" -ge 1 ]; then
+            echo "✅ PR #${PR_NUMBER} is linked to ${COUNT} open issue(s):"
+            jq -r '.[] | select(.state == "OPEN") | "   ✓ #\(.number) \(.title) (\(.url))"' <<<"$LINKED"
+            exit 0
+          fi
+
+          # Closing keywords only link on the default branch, so also accept plain references in the body.
+          # HTML comments are stripped so examples in PR templates don't count.
+          BODY=$(jq -r '.data.repository.pullRequest.body // ""' <<<"$RESULT" | perl -0pe 's/<!--.*?-->//gs')
+
+          REFS=$(
+            {
+              { grep -oE 'https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9_.-]+/issues/[0-9]+' <<<"$BODY" || true; } \
+                | sed -E 's#https://github\.com/([^/]+/[^/]+)/issues/([0-9]+)#\1 \2#'
+              { grep -oE '[A-Za-z0-9-]+/[A-Za-z0-9_.-]+#[0-9]+' <<<"$BODY" || true; } \
+                | sed -E 's/#/ /'
+              { grep -oE '(^|[^A-Za-z0-9_./#-])#[0-9]+' <<<"$BODY" || true; } \
+                | { grep -oE '[0-9]+' || true; } | sed "s#^#${REPO} #"
+            } | sort -u | head -n 20
+          )
+
+          FOUND=0
+          while read -r REF_REPO REF_NUM; do
+            [ -n "${REF_REPO}" ] || continue
+            if ! INFO=$(gh api "repos/${REF_REPO}/issues/${REF_NUM}" 2>/dev/null) \
+              || [ "$(jq -r 'has("pull_request")' <<<"$INFO")" != "false" ]; then
+              echo "   ✗ ${REF_REPO}#${REF_NUM} is not an accessible issue, ignored"
+            elif [ "$(jq -r '.state' <<<"$INFO")" != "open" ]; then
+              echo "   ✗ ${REF_REPO}#${REF_NUM} is closed, ignored"
+            else
+              jq -r '"   ✓ #\(.number) \(.title) (\(.html_url))"' <<<"$INFO"
+              FOUND=$((FOUND + 1))
+            fi
+          done <<<"$REFS"
+
+          if [ "${FOUND}" -ge 1 ]; then
+            echo "✅ PR #${PR_NUMBER} references ${FOUND} open issue(s) in its description."
+            exit 0
+          fi
+
+          echo "::error::PR #${PR_NUMBER} is not linked to any open issue."
+          echo "::error::Reference an issue in the PR description (e.g. 'Closes #123', 'Refs #123', 'owner/repo#123' or an issue URL), or link one via the Development section in the PR sidebar."
+          echo "::error::Note: linking via the sidebar does not trigger this check. Edit the PR description or re-run this workflow afterwards."
+          exit 1
