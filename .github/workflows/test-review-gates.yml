@@ -1,0 +1,154 @@
+name: Test Review Gates
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/human-review.yml
+      - .github/workflows/ai-code-review.yml
+      - .github/workflows/test-review-gates.yml
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/human-review.yml
+      - .github/workflows/ai-code-review.yml
+      - .github/workflows/test-review-gates.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  test:
+    name: Test Review Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract gate scripts and stubs
+        run: |
+          set -euo pipefail
+          HUMAN_GATE="$RUNNER_TEMP/human-review.sh"
+          AI_GATE="$RUNNER_TEMP/ai-code-review.sh"
+          STUBS="$RUNNER_TEMP/stubs"
+          {
+            echo "HUMAN_GATE=$HUMAN_GATE"
+            echo "AI_GATE=$AI_GATE"
+            echo "STUBS=$STUBS"
+          } >> "$GITHUB_ENV"
+
+          yq -e '.jobs["human-review"].steps[] | select(.name == "Wait for human approval") | .run' \
+            .github/workflows/human-review.yml > "$HUMAN_GATE"
+          yq -e '.jobs["ai-code-review"].steps[] | select(.name == "Wait for Copilot review") | .run' \
+            .github/workflows/ai-code-review.yml > "$AI_GATE"
+
+          mkdir -p "$STUBS"
+          # The gates only sleep when the awaited review was not found, so exit 99 means "still waiting".
+          printf '#!/bin/sh\nexit 99\n' > "$STUBS/sleep"
+          cat > "$STUBS/gh" <<'EOF'
+          #!/usr/bin/env bash
+          if [ "${GH_FAIL:-0}" = 1 ]; then
+            echo "gh: Server Error (HTTP 500)" >&2
+            exit 1
+          fi
+          expected="api --paginate --slurp repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100"
+          if [ "$*" != "$expected" ]; then
+            echo "unexpected gh call: $*" >&2
+            exit 2
+          fi
+          cat "$GH_FIXTURE"
+          EOF
+          chmod +x "$STUBS/sleep" "$STUBS/gh"
+
+      - name: Scenario tests
+        run: |
+          set -euo pipefail
+          FAILED=0
+          APPROVED=0 WAITING=99 ERROR=1
+          COPILOT="copilot-pull-request-reviewer[bot]"
+
+          # Each spec is login:type:state, in submission order; output is split into 100-item pages.
+          fixture() {
+            jq -nc '[$ARGS.positional | to_entries[] | (.value | split(":")) as [$u, $t, $s]
+                     | {user: {login: $u, type: $t}, state: $s, submitted_at: (1767225600 + .key * 60 | todate)}]
+                    | if length == 0 then [[]] else [range(0; length; 100) as $i | .[$i:$i + 100]] end' \
+              --args "$@" > "$RUNNER_TEMP/fixture.json"
+          }
+
+          fillers() {
+            for i in $(seq 1 "$1"); do echo "filler$i:User:COMMENTED"; done
+          }
+
+          # Usage: run_case <gate> <name> <expected exit> [specs...]; PR / GH_FAIL may be overridden per call.
+          run_case() {
+            local gate=$1 name=$2 expected=$3 actual
+            shift 3
+            fixture "$@"
+            set +e
+            PATH="$STUBS:$PATH" GH_FIXTURE="$RUNNER_TEMP/fixture.json" GH_FAIL="${GH_FAIL:-0}" \
+              PR_NUMBER="${PR-42}" REPO=t-head/test bash "$gate" > "$RUNNER_TEMP/out.log" 2>&1
+            actual=$?
+            set -e
+            if [ "$actual" = "$expected" ]; then
+              echo "✓ ${name} (exit ${actual})"
+            else
+              echo "::error::✗ ${name}: expected exit ${expected}, got ${actual}"
+              echo "::group::${name} output"; cat "$RUNNER_TEMP/out.log"; echo "::endgroup::"
+              FAILED=1
+            fi
+          }
+
+          echo "── human-review.yml"
+          G=$HUMAN_GATE
+          run_case $G "no reviews" $WAITING
+          run_case $G "single approval" $APPROVED alice:User:APPROVED
+          run_case $G "approval on page 2" $APPROVED $(fillers 100) alice:User:APPROVED
+          run_case $G "changes requested on page 2 overrides approval" $WAITING \
+            alice:User:APPROVED $(fillers 99) alice:User:CHANGES_REQUESTED
+          run_case $G "comment after approval keeps approval" $APPROVED alice:User:APPROVED alice:User:COMMENTED
+          run_case $G "re-approval after changes requested" $APPROVED alice:User:CHANGES_REQUESTED alice:User:APPROVED
+          run_case $G "dismissed approval" $WAITING alice:User:DISMISSED
+          run_case $G "bot approval ignored" $WAITING copilot:Bot:APPROVED
+          run_case $G "one of two reviewers approves" $APPROVED alice:User:CHANGES_REQUESTED bob:User:APPROVED
+          GH_FAIL=1 run_case $G "API failure" $ERROR
+          PR="" run_case $G "missing PR context" $ERROR
+
+          echo "── ai-code-review.yml"
+          G=$AI_GATE
+          run_case $G "no reviews" $WAITING
+          run_case $G "Copilot review" $APPROVED "$COPILOT:Bot:COMMENTED"
+          run_case $G "Copilot review on page 2" $APPROVED $(fillers 100) "$COPILOT:Bot:COMMENTED"
+          run_case $G "human reviews only" $WAITING alice:User:APPROVED $(fillers 120)
+          run_case $G "other bot ignored" $WAITING other-bot:Bot:COMMENTED
+          GH_FAIL=1 run_case $G "API failure" $ERROR
+          PR="" run_case $G "missing PR context" $ERROR
+
+          exit "$FAILED"
+
+      - name: Live API check
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set +e
+          FAILED=0
+          mkdir -p "$RUNNER_TEMP/sleep-only"
+          cp "$STUBS/sleep" "$RUNNER_TEMP/sleep-only/sleep"
+          for gate in "$HUMAN_GATE" "$AI_GATE"; do
+            name=$(basename "$gate" .sh)
+            PATH="$RUNNER_TEMP/sleep-only:$PATH" bash "$gate" > "$RUNNER_TEMP/live.log" 2>&1
+            code=$?
+            case "$code" in
+              0) echo "✓ ${name}: passed against the real API (awaited review already present)" ;;
+              99) echo "✓ ${name}: reached the polling wait against the real API" ;;
+              *)
+                echo "::error::${name} failed against the real API with exit ${code}"
+                cat "$RUNNER_TEMP/live.log"
+                FAILED=1
+                ;;
+            esac
+          done
+          exit "$FAILED"
