@@ -41,20 +41,12 @@ jobs:
           ELAPSED=0
 
           while true; do
-            REVIEWS_JSON=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100")
+            REVIEWS_JSON=$(gh api --paginate --slurp \
+              "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" | jq 'add // []')
 
-            # Validate API response
-            if ! echo "$REVIEWS_JSON" | jq -e 'type == "array"' > /dev/null 2>&1; then
-              echo "::error::Failed to fetch PR reviews. API response:"
-              echo "$REVIEWS_JSON" | jq . 2>/dev/null || echo "$REVIEWS_JSON"
-              exit 1
-            fi
-
-            # For each human reviewer, take their latest review; keep state==APPROVED
+            # COMMENTED reviews don't change a reviewer's verdict, matching GitHub's own approval logic.
             APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq -r '
-              [ .[] | select(.user.type != "Bot") ]
+              [ .[] | select(.user.type != "Bot" and .state != "COMMENTED" and .state != "PENDING") ]
               | group_by(.user.login)
               | map(sort_by(.submitted_at) | last)
               | [ .[] | select(.state == "APPROVED") ]
