@@ -20,9 +20,6 @@ jobs:
   test:
     name: Test Human Review Gate
     runs-on: ubuntu-latest
-    env:
-      GATE_SCRIPT: ${{ runner.temp }}/gate.sh
-      STUBS: ${{ runner.temp }}/stubs
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,6 +27,10 @@ jobs:
       - name: Extract gate script and stubs
         run: |
           set -euo pipefail
+          GATE_SCRIPT="$RUNNER_TEMP/gate.sh"
+          STUBS="$RUNNER_TEMP/stubs"
+          echo "GATE_SCRIPT=$GATE_SCRIPT" >> "$GITHUB_ENV"
+          echo "STUBS=$STUBS" >> "$GITHUB_ENV"
           yq -e '.jobs["human-review"].steps[] | select(.name == "Wait for human approval") | .run' \
             .github/workflows/human-review.yml > "$GATE_SCRIPT"
 
