@@ -28,7 +28,7 @@ jobs:
           fi
 
           POLL_INTERVAL=20
-          MAX_WAIT=480  # 8 minutes
+          MAX_WAIT=900  # 15 minutes
           ELAPSED=0
 
           echo "🤖 Waiting for Copilot code review on PR #${PR_NUMBER}..."
