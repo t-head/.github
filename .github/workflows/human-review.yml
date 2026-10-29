@@ -40,10 +40,8 @@ jobs:
           MAX_WAIT=21600  # 6 hours
           ELAPSED=0
 
-          # On a public repository any signed-in account can submit an approving review, so a
-          # drive-by approval would otherwise unlock the pipeline and the cluster jobs behind it.
-          WRITE_ASSOCIATIONS='["OWNER", "MEMBER", "COLLABORATOR"]'
-          echo "ℹ️  Only approvals from OWNER / MEMBER / COLLABORATOR reviewers open this gate."
+          # Private organization membership can appear as author_association NONE to GITHUB_TOKEN.
+          echo "Only approvals from reviewers with repository write access open this gate."
           echo ""
 
           while true; do
@@ -51,35 +49,37 @@ jobs:
               "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" | jq 'add // []')
 
             # COMMENTED reviews don't change a reviewer's verdict, matching GitHub's own approval logic.
-            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq -r --argjson allowed "$WRITE_ASSOCIATIONS" '
-              [ .[]
-                | select(.user.type != "Bot")
-                | select((.author_association // "NONE") as $a | $allowed | index($a))
-                | select(.state != "COMMENTED" and .state != "PENDING")
-              ]
+            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq '
+              [ .[] | select(.user.type != "Bot" and .state != "COMMENTED" and .state != "PENDING") ]
               | group_by(.user.login)
               | map(sort_by(.submitted_at) | last)
               | [ .[] | select(.state == "APPROVED") ]
             ')
 
-            APPROVE_COUNT=$(echo "$APPROVED_HUMANS" | jq 'length')
+            APPROVE_COUNT=0
+            while IFS= read -r REVIEWER; do
+              if ! PERMISSION=$(gh api "repos/${REPO}/collaborators/${REVIEWER}/permission" | jq -er '.permission'); then
+                echo "::error::Cannot verify repository permission for ${REVIEWER}."
+                exit 1
+              fi
+              case "$PERMISSION" in
+                write|admin)
+                  echo "   ${REVIEWER} approved with repository permission: ${PERMISSION}"
+                  APPROVE_COUNT=$((APPROVE_COUNT + 1))
+                  ;;
+                read|none)
+                  echo "   Ignoring approval from ${REVIEWER}: repository permission is ${PERMISSION}."
+                  ;;
+                *)
+                  echo "::error::Unexpected repository permission for ${REVIEWER}: ${PERMISSION}"
+                  exit 1
+                  ;;
+              esac
+            done < <(echo "$APPROVED_HUMANS" | jq -r '.[].user.login')
 
             if [ "$APPROVE_COUNT" -ge 1 ]; then
-              echo ""
-              echo "✅ Human review approval detected! (${APPROVE_COUNT} approver(s))"
-              echo "$APPROVED_HUMANS" | jq -r '.[] | "   ✓ \(.user.login) (\(.author_association)) approved at \(.submitted_at)"'
+              echo "Human review approval detected! (${APPROVE_COUNT} approver(s) with write access)"
               exit 0
-            fi
-
-            IGNORED_COUNT=$(echo "$REVIEWS_JSON" | jq --argjson allowed "$WRITE_ASSOCIATIONS" '
-              [ .[]
-                | select(.user.type != "Bot" and .state == "APPROVED")
-                | select((.author_association // "NONE") as $a | $allowed | index($a) | not)
-              ] | length
-            ')
-
-            if [ "$IGNORED_COUNT" -ge 1 ]; then
-              echo "  ℹ️  Ignoring ${IGNORED_COUNT} approval(s) from reviewer(s) without write access."
             fi
 
             if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
