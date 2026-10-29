@@ -68,10 +68,13 @@ jobs:
           APPROVED=0 WAITING=99 ERROR=1
           COPILOT="copilot-pull-request-reviewer[bot]"
 
-          # Each spec is login:type:state, in submission order; output is split into 100-item pages.
+          # Each spec is login:type:state[:association], in submission order; a spec without an
+          # association defaults to COLLABORATOR. Output is split into 100-item pages.
           fixture() {
-            jq -nc '[$ARGS.positional | to_entries[] | (.value | split(":")) as [$u, $t, $s]
-                     | {user: {login: $u, type: $t}, state: $s, submitted_at: (1767225600 + .key * 60 | todate)}]
+            jq -nc '[$ARGS.positional | to_entries[] | (.value | split(":")) as [$u, $t, $s, $a]
+                     | {user: {login: $u, type: $t}, state: $s,
+                        author_association: ($a // "COLLABORATOR"),
+                        submitted_at: (1767225600 + .key * 60 | todate)}]
                     | if length == 0 then [[]] else [range(0; length; 100) as $i | .[$i:$i + 100]] end' \
               --args "$@" > "$RUNNER_TEMP/fixture.json"
           }
@@ -111,6 +114,15 @@ jobs:
           run_case $G "dismissed approval" $WAITING alice:User:DISMISSED
           run_case $G "bot approval ignored" $WAITING copilot:Bot:APPROVED
           run_case $G "one of two reviewers approves" $APPROVED alice:User:CHANGES_REQUESTED bob:User:APPROVED
+          run_case $G "owner approval" $APPROVED alice:User:APPROVED:OWNER
+          run_case $G "org member approval" $APPROVED alice:User:APPROVED:MEMBER
+          run_case $G "outside account approval ignored" $WAITING drive-by:User:APPROVED:NONE
+          run_case $G "contributor approval ignored" $WAITING forker:User:APPROVED:CONTRIBUTOR
+          run_case $G "unknown association ignored" $WAITING "mystery:User:APPROVED:"
+          run_case $G "collaborator approval outweighs outside approval" $APPROVED \
+            drive-by:User:APPROVED:NONE alice:User:APPROVED:COLLABORATOR
+          run_case $G "outside changes requested does not block" $APPROVED \
+            alice:User:APPROVED:COLLABORATOR drive-by:User:CHANGES_REQUESTED:NONE
           GH_FAIL=1 run_case $G "API failure" $ERROR
           PR="" run_case $G "missing PR context" $ERROR
 

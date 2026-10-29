@@ -40,13 +40,23 @@ jobs:
           MAX_WAIT=21600  # 6 hours
           ELAPSED=0
 
+          # On a public repository any signed-in account can submit an approving review, so a
+          # drive-by approval would otherwise unlock the pipeline and the cluster jobs behind it.
+          WRITE_ASSOCIATIONS='["OWNER", "MEMBER", "COLLABORATOR"]'
+          echo "ℹ️  Only approvals from OWNER / MEMBER / COLLABORATOR reviewers open this gate."
+          echo ""
+
           while true; do
             REVIEWS_JSON=$(gh api --paginate --slurp \
               "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" | jq 'add // []')
 
             # COMMENTED reviews don't change a reviewer's verdict, matching GitHub's own approval logic.
-            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq -r '
-              [ .[] | select(.user.type != "Bot" and .state != "COMMENTED" and .state != "PENDING") ]
+            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq -r --argjson allowed "$WRITE_ASSOCIATIONS" '
+              [ .[]
+                | select(.user.type != "Bot")
+                | select((.author_association // "NONE") as $a | $allowed | index($a))
+                | select(.state != "COMMENTED" and .state != "PENDING")
+              ]
               | group_by(.user.login)
               | map(sort_by(.submitted_at) | last)
               | [ .[] | select(.state == "APPROVED") ]
@@ -57,8 +67,19 @@ jobs:
             if [ "$APPROVE_COUNT" -ge 1 ]; then
               echo ""
               echo "✅ Human review approval detected! (${APPROVE_COUNT} approver(s))"
-              echo "$APPROVED_HUMANS" | jq -r '.[] | "   ✓ \(.user.login) approved at \(.submitted_at)"'
+              echo "$APPROVED_HUMANS" | jq -r '.[] | "   ✓ \(.user.login) (\(.author_association)) approved at \(.submitted_at)"'
               exit 0
+            fi
+
+            IGNORED_COUNT=$(echo "$REVIEWS_JSON" | jq --argjson allowed "$WRITE_ASSOCIATIONS" '
+              [ .[]
+                | select(.user.type != "Bot" and .state == "APPROVED")
+                | select((.author_association // "NONE") as $a | $allowed | index($a) | not)
+              ] | length
+            ')
+
+            if [ "$IGNORED_COUNT" -ge 1 ]; then
+              echo "  ℹ️  Ignoring ${IGNORED_COUNT} approval(s) from reviewer(s) without write access."
             fi
 
             if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
