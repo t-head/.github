@@ -164,3 +164,12 @@ jobs:
             esac
           done
           exit "$FAILED"
+
+  # End-to-end scenario: run the unmodified gate against this very pull request. The stubbed
+  # scenarios prove the filter logic, only this proves the gate really blocks until a reviewer
+  # with write access approves. Inherits the gate's own 360-minute wait.
+  human-review:
+    name: Human Review Gate (this PR)
+    needs: test
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/human-review.yml
