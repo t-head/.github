@@ -53,11 +53,22 @@ jobs:
             exit 1
           fi
           expected="api --paginate --slurp repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100"
-          if [ "$*" != "$expected" ]; then
-            echo "unexpected gh call: $*" >&2
-            exit 2
-          fi
-          cat "$GH_FIXTURE"
+          case "$*" in
+            "$expected") cat "$GH_FIXTURE" ;;
+            "api repos/${REPO}/collaborators/"*"/permission")
+              if [ "${GH_PERMISSION_FAIL:-0}" = 1 ]; then
+                echo "gh: Resource not accessible by integration (HTTP 403)" >&2
+                exit 1
+              fi
+              reviewer=${2#repos/${REPO}/collaborators/}
+              reviewer=${reviewer%/permission}
+              jq -c --arg login "$reviewer" '{permission: .[$login]}' "$GH_PERMISSIONS_FIXTURE"
+              ;;
+            *)
+              echo "unexpected gh call: $*" >&2
+              exit 2
+              ;;
+          esac
           EOF
           chmod +x "$STUBS/sleep" "$STUBS/gh"
 
@@ -68,12 +79,17 @@ jobs:
           APPROVED=0 WAITING=99 ERROR=1
           COPILOT="copilot-pull-request-reviewer[bot]"
 
-          # Each spec is login:type:state, in submission order; output is split into 100-item pages.
+          # Specs are login:type:state[:association[:permission]], defaulting to NONE and write.
           fixture() {
-            jq -nc '[$ARGS.positional | to_entries[] | (.value | split(":")) as [$u, $t, $s]
-                     | {user: {login: $u, type: $t}, state: $s, submitted_at: (1767225600 + .key * 60 | todate)}]
+            jq -nc '[$ARGS.positional | to_entries[] | (.value | split(":")) as [$u, $t, $s, $a, $p]
+                     | {user: {login: $u, type: $t}, state: $s,
+                        author_association: ($a // "NONE"),
+                        submitted_at: (1767225600 + .key * 60 | todate)}]
                     | if length == 0 then [[]] else [range(0; length; 100) as $i | .[$i:$i + 100]] end' \
               --args "$@" > "$RUNNER_TEMP/fixture.json"
+            jq -nc 'reduce $ARGS.positional[] as $spec ({};
+                      ($spec | split(":")) as [$u, $t, $s, $a, $p] | .[$u] = ($p // "write"))' \
+              --args "$@" > "$RUNNER_TEMP/permissions.json"
           }
 
           fillers() {
@@ -87,6 +103,7 @@ jobs:
             fixture "$@"
             set +e
             PATH="$STUBS:$PATH" GH_FIXTURE="$RUNNER_TEMP/fixture.json" GH_FAIL="${GH_FAIL:-0}" \
+              GH_PERMISSIONS_FIXTURE="$RUNNER_TEMP/permissions.json" GH_PERMISSION_FAIL="${GH_PERMISSION_FAIL:-0}" \
               PR_NUMBER="${PR-42}" REPO=t-head/test bash "$gate" > "$RUNNER_TEMP/out.log" 2>&1
             actual=$?
             set -e
@@ -111,6 +128,26 @@ jobs:
           run_case $G "dismissed approval" $WAITING alice:User:DISMISSED
           run_case $G "bot approval ignored" $WAITING copilot:Bot:APPROVED
           run_case $G "one of two reviewers approves" $APPROVED alice:User:CHANGES_REQUESTED bob:User:APPROVED
+          run_case $G "owner approval" $APPROVED alice:User:APPROVED:OWNER:admin
+          run_case $G "org member approval" $APPROVED alice:User:APPROVED:MEMBER:write
+          run_case $G "outside account approval ignored" $WAITING drive-by:User:APPROVED:NONE:read
+          run_case $G "contributor approval ignored" $WAITING forker:User:APPROVED:CONTRIBUTOR:none
+          run_case $G "private organization admin approval" $APPROVED Mars-314:User:APPROVED:NONE:admin
+          run_case $G "private organization writer approval" $APPROVED alice:User:APPROVED:NONE:write
+          run_case $G "blank association with write access" $APPROVED "alice:User:APPROVED::write"
+          run_case $G "org member without write access ignored" $WAITING alice:User:APPROVED:MEMBER:read
+          run_case $G "collaborator without write access ignored" $WAITING alice:User:APPROVED:COLLABORATOR:read
+          run_case $G "bot admin approval ignored" $WAITING copilot:Bot:APPROVED:NONE:admin
+          run_case $G "pending review ignored" $WAITING alice:User:PENDING:NONE:admin
+          run_case $G "association change does not hide latest verdict" $WAITING \
+            alice:User:APPROVED:MEMBER:write alice:User:CHANGES_REQUESTED:NONE:write
+          run_case $G "collaborator approval outweighs outside approval" $APPROVED \
+            drive-by:User:APPROVED:NONE:read alice:User:APPROVED:COLLABORATOR:write
+          run_case $G "outside changes requested does not block" $APPROVED \
+            alice:User:APPROVED:COLLABORATOR:write drive-by:User:CHANGES_REQUESTED:NONE:read
+          run_case $G "unknown permission rejected" $ERROR alice:User:APPROVED:NONE:unexpected
+          run_case $G "blank permission rejected" $ERROR "alice:User:APPROVED:NONE:"
+          GH_PERMISSION_FAIL=1 run_case $G "permission API failure" $ERROR alice:User:APPROVED
           GH_FAIL=1 run_case $G "API failure" $ERROR
           PR="" run_case $G "missing PR context" $ERROR
 
@@ -152,3 +189,12 @@ jobs:
             esac
           done
           exit "$FAILED"
+
+  # End-to-end scenario: run the unmodified gate against this very pull request. The stubbed
+  # scenarios prove the filter logic, only this proves the gate really blocks until a reviewer
+  # with write access approves. Inherits the gate's own 360-minute wait.
+  human-review:
+    name: Human Review Gate (this PR)
+    needs: test
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/human-review.yml

@@ -40,24 +40,45 @@ jobs:
           MAX_WAIT=21600  # 6 hours
           ELAPSED=0
 
+          # Private organization membership can appear as author_association NONE to GITHUB_TOKEN.
+          echo "Only approvals from reviewers with repository write access open this gate."
+          echo ""
+
           while true; do
             REVIEWS_JSON=$(gh api --paginate --slurp \
               "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" | jq 'add // []')
 
             # COMMENTED reviews don't change a reviewer's verdict, matching GitHub's own approval logic.
-            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq -r '
+            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq '
               [ .[] | select(.user.type != "Bot" and .state != "COMMENTED" and .state != "PENDING") ]
               | group_by(.user.login)
               | map(sort_by(.submitted_at) | last)
               | [ .[] | select(.state == "APPROVED") ]
             ')
 
-            APPROVE_COUNT=$(echo "$APPROVED_HUMANS" | jq 'length')
+            APPROVE_COUNT=0
+            while IFS= read -r REVIEWER; do
+              if ! PERMISSION=$(gh api "repos/${REPO}/collaborators/${REVIEWER}/permission" | jq -er '.permission'); then
+                echo "::error::Cannot verify repository permission for ${REVIEWER}."
+                exit 1
+              fi
+              case "$PERMISSION" in
+                write|admin)
+                  echo "   ${REVIEWER} approved with repository permission: ${PERMISSION}"
+                  APPROVE_COUNT=$((APPROVE_COUNT + 1))
+                  ;;
+                read|none)
+                  echo "   Ignoring approval from ${REVIEWER}: repository permission is ${PERMISSION}."
+                  ;;
+                *)
+                  echo "::error::Unexpected repository permission for ${REVIEWER}: ${PERMISSION}"
+                  exit 1
+                  ;;
+              esac
+            done < <(echo "$APPROVED_HUMANS" | jq -r '.[].user.login')
 
             if [ "$APPROVE_COUNT" -ge 1 ]; then
-              echo ""
-              echo "✅ Human review approval detected! (${APPROVE_COUNT} approver(s))"
-              echo "$APPROVED_HUMANS" | jq -r '.[] | "   ✓ \(.user.login) approved at \(.submitted_at)"'
+              echo "Human review approval detected! (${APPROVE_COUNT} approver(s) with write access)"
               exit 0
             fi
 
