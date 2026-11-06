@@ -3,9 +3,8 @@ name: AI Code Review (Copilot Gate)
 on:
   workflow_call:
 
-permissions:
-  contents: read
-  pull-requests: read
+# No permissions block on purpose: a called workflow can only keep or narrow the caller's
+# GITHUB_TOKEN scopes, so callers that grant pull-requests: write let the gate request Copilot.
 
 jobs:
   ai-code-review:
@@ -28,8 +27,11 @@ jobs:
           fi
 
           POLL_INTERVAL=20
-          MAX_WAIT=900  # 15 minutes
+          MAX_WAIT=1800  # 30 minutes
           ELAPSED=0
+          # The ruleset requests Copilot within seconds of a PR opening; only step in once that window has passed.
+          REQUEST_GRACE=60
+          REQUEST_CHECKED=0
 
           echo "🤖 Waiting for Copilot code review on PR #${PR_NUMBER}..."
           echo ""
@@ -53,6 +55,41 @@ jobs:
               echo "   State: ${REVIEW_STATE}"
               echo "   Submitted at: ${REVIEW_TIME}"
               exit 0
+            fi
+
+            # A pending Copilot review is not listed in requested_reviewers, so the timeline is the only
+            # reliable record of whether the ruleset (or anyone) has already asked Copilot.
+            if [ "$REQUEST_CHECKED" = 0 ]; then
+              if ! PR_JSON=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}"); then
+                REQUEST_CHECKED=1
+                echo "::warning::Cannot read PR #${PR_NUMBER}; skipping the Copilot request fallback."
+              elif [ $(( $(date +%s) - $(echo "$PR_JSON" | jq -r '.created_at | fromdateiso8601') )) -ge "$REQUEST_GRACE" ]; then
+                REQUEST_CHECKED=1
+                if ! TIMELINE_JSON=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR_NUMBER}/timeline?per_page=100"); then
+                  echo "::warning::Cannot read the PR timeline; skipping the Copilot request fallback."
+                elif [ "$(echo "$TIMELINE_JSON" | jq '[ add // [] | .[]
+                      | select(.event == "review_requested"
+                               and ((.requested_reviewer.login // "") | ascii_downcase
+                                    | IN("copilot", "copilot-pull-request-reviewer", "copilot-pull-request-reviewer[bot]"))) ]
+                      | length')" -eq 0 ]; then
+                  echo "  🔁 Copilot was never requested on this PR, requesting it once."
+                  # The REST review-request endpoint answers 201 even when Copilot refuses; GraphQL reports why.
+                  REQUEST_RESULT=$(gh api graphql -f id="$(echo "$PR_JSON" | jq -r '.node_id')" \
+                    -f query='mutation($id: ID!) { requestCopilotCodeReview(input: {pullRequestId: $id}) { success failureReason } }' \
+                    2>&1) || true
+                  REQUEST_SUCCESS=$(echo "$REQUEST_RESULT" | jq -r '.data.requestCopilotCodeReview.success // false' 2>/dev/null || true)
+                  REQUEST_REASON=$(echo "$REQUEST_RESULT" | jq -r '.data.requestCopilotCodeReview.failureReason // empty' 2>/dev/null || true)
+                  # Workflow commands end at the first newline, so keep the whole diagnostic on one line.
+                  REQUEST_DETAIL=$(echo "$REQUEST_RESULT" | tr '\n' ' ')
+                  if [ "$REQUEST_SUCCESS" = true ]; then
+                    echo "  ✅ Copilot review requested."
+                  elif [ -n "$REQUEST_REASON" ]; then
+                    echo "::warning::Copilot declined the review request (${REQUEST_REASON}). Check the organization's Copilot code review settings, or request Copilot manually."
+                  else
+                    echo "::warning::Could not call the Copilot review API: ${REQUEST_DETAIL}| The caller must grant pull-requests: write (fork PRs are always read-only); request Copilot manually."
+                  fi
+                fi
+              fi
             fi
 
             ELAPSED=$((ELAPSED + POLL_INTERVAL))
