@@ -69,7 +69,7 @@ jobs:
               jq -c --arg login "$reviewer" '{permission: .[$login]}' "$GH_PERMISSIONS_FIXTURE"
               ;;
             "api repos/${REPO}/pulls/${PR_NUMBER}")
-              printf '{"created_at":"%s"}\n' "${GH_PR_CREATED:-2026-01-01T00:00:00Z}"
+              printf '{"node_id":"PR_test","created_at":"%s"}\n' "${GH_PR_CREATED:-2026-01-01T00:00:00Z}"
               ;;
             "api --paginate --slurp repos/${REPO}/issues/${PR_NUMBER}/timeline?per_page=100")
               if [ "${GH_TIMELINE_FAIL:-0}" = 1 ]; then
@@ -82,13 +82,18 @@ jobs:
                 echo '[[{"event":"committed"},{"event":"review_requested","requested_reviewer":{"login":"alice"}}]]'
               fi
               ;;
-            "api -X POST repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers -f reviewers[]=copilot-pull-request-reviewer[bot]")
+            "api graphql -f id=PR_test -f query="*"requestCopilotCodeReview"*)
               echo requested >> "$GH_REQUEST_LOG"
               if [ "${GH_REQUEST_FAIL:-0}" = 1 ]; then
-                echo "gh: Resource not accessible by integration (HTTP 403)" >&2
+                echo '{"errors":[{"type":"FORBIDDEN","message":"Resource not accessible by integration"}]}'
+                echo "gh: Resource not accessible by integration" >&2
                 exit 1
               fi
-              echo '{}'
+              if [ -n "${GH_REQUEST_REASON:-}" ]; then
+                printf '{"data":{"requestCopilotCodeReview":{"success":false,"failureReason":"%s"}}}\n' "$GH_REQUEST_REASON"
+              else
+                echo '{"data":{"requestCopilotCodeReview":{"success":true,"failureReason":null}}}'
+              fi
               ;;
             *)
               echo "unexpected gh call: $*" >&2
@@ -134,7 +139,7 @@ jobs:
               GH_PERMISSIONS_FIXTURE="$RUNNER_TEMP/permissions.json" GH_PERMISSION_FAIL="${GH_PERMISSION_FAIL:-0}" \
               GH_PR_CREATED="${GH_PR_CREATED:-}" GH_TIMELINE_FAIL="${GH_TIMELINE_FAIL:-0}" \
               GH_COPILOT_REQUESTED="${GH_COPILOT_REQUESTED:-1}" GH_REQUEST_FAIL="${GH_REQUEST_FAIL:-0}" \
-              GH_REQUEST_LOG="$REQUEST_LOG" \
+              GH_REQUEST_REASON="${GH_REQUEST_REASON:-}" GH_REQUEST_LOG="$REQUEST_LOG" \
               PR_NUMBER="${PR-42}" REPO=t-head/test bash "$gate" > "$RUNNER_TEMP/out.log" 2>&1
             actual=$?
             set -e
@@ -211,6 +216,13 @@ jobs:
           expect_requests "fresh PR left to the ruleset" 0
           GH_COPILOT_REQUESTED=0 GH_REQUEST_FAIL=1 run_case $G "read-only token keeps waiting" $WAITING
           expect_requests "read-only token keeps waiting" 1
+          GH_COPILOT_REQUESTED=0 GH_REQUEST_REASON=REPOSITORY_INELIGIBLE \
+            run_case $G "declined request keeps waiting" $WAITING
+          expect_requests "declined request keeps waiting" 1
+          if ! grep -q 'REPOSITORY_INELIGIBLE' "$RUNNER_TEMP/out.log"; then
+            echo "::error::✗ declined request keeps waiting: failure reason missing from the gate output"
+            FAILED=1
+          fi
           GH_COPILOT_REQUESTED=0 GH_TIMELINE_FAIL=1 run_case $G "unreadable timeline skips request" $WAITING
           expect_requests "unreadable timeline skips request" 0
           GH_COPILOT_REQUESTED=0 run_case $G "existing Copilot review skips request" $APPROVED "$COPILOT:Bot:COMMENTED"

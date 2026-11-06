@@ -29,7 +29,6 @@ jobs:
           POLL_INTERVAL=20
           MAX_WAIT=1800  # 30 minutes
           ELAPSED=0
-          COPILOT_BOT="copilot-pull-request-reviewer[bot]"
           # The ruleset requests Copilot within seconds of a PR opening; only step in once that window has passed.
           REQUEST_GRACE=60
           REQUEST_CHECKED=0
@@ -73,11 +72,15 @@ jobs:
                                and ((.requested_reviewer.login // "") | ascii_downcase | startswith("copilot"))) ]
                       | length')" -eq 0 ]; then
                   echo "  🔁 Copilot was never requested on this PR, requesting it once."
-                  if gh api -X POST "repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
-                      -f "reviewers[]=${COPILOT_BOT}" > /dev/null; then
+                  # The REST review-request endpoint answers 201 even when Copilot refuses; GraphQL reports why.
+                  REQUEST_RESULT=$(gh api graphql -f id="$(echo "$PR_JSON" | jq -r '.node_id')" \
+                    -f query='mutation($id: ID!) { requestCopilotCodeReview(input: {pullRequestId: $id}) { success failureReason } }' \
+                    2>&1) || true
+                  if [ "$(echo "$REQUEST_RESULT" | jq -r '.data.requestCopilotCodeReview.success // false' 2>/dev/null)" = true ]; then
                     echo "  ✅ Copilot review requested."
                   else
-                    echo "::warning::Could not request Copilot. The caller must grant pull-requests: write, and fork PRs always get a read-only token; request Copilot manually."
+                    REQUEST_REASON=$(echo "$REQUEST_RESULT" | jq -r '.data.requestCopilotCodeReview.failureReason // empty' 2>/dev/null || true)
+                    echo "::warning::Could not request Copilot (${REQUEST_REASON:-${REQUEST_RESULT}}). The caller must grant pull-requests: write and fork PRs are read-only; request Copilot manually."
                   fi
                 fi
               fi
