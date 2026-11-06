@@ -49,7 +49,25 @@ jobs:
 
           mkdir -p "$STUBS"
           # The gates only sleep when the awaited review was not found, so exit 99 means "still waiting".
-          printf '#!/bin/sh\nexit 99\n' > "$STUBS/sleep"
+          # SLEEP_POLLS lets a case run several polls; FAKE_CLOCK advances by each sleep's duration.
+          cat > "$STUBS/sleep" <<'EOF'
+          #!/bin/sh
+          [ -n "${SLEEP_POLLS:-}" ] || exit 99
+          if [ -n "${FAKE_CLOCK:-}" ]; then
+            echo $(( $(cat "$FAKE_CLOCK") + $1 )) > "$FAKE_CLOCK"
+          fi
+          polls=$(( $(cat "$SLEEP_STATE" 2>/dev/null || echo 0) + 1 ))
+          echo "$polls" > "$SLEEP_STATE"
+          [ "$polls" -lt "$SLEEP_POLLS" ] || exit 99
+          EOF
+          cat > "$STUBS/date" <<'EOF'
+          #!/bin/sh
+          if [ -n "${FAKE_CLOCK:-}" ] && [ "$*" = "+%s" ]; then
+            cat "$FAKE_CLOCK"
+          else
+            exec /bin/date "$@"
+          fi
+          EOF
           cat > "$STUBS/gh" <<'EOF'
           #!/usr/bin/env bash
           if [ "${GH_FAIL:-0}" = 1 ]; then
@@ -77,7 +95,7 @@ jobs:
                 exit 1
               fi
               if [ "${GH_COPILOT_REQUESTED:-1}" = 1 ]; then
-                echo '[[{"event":"review_requested","requested_reviewer":{"login":"Copilot"}}]]'
+                printf '[[{"event":"review_requested","requested_reviewer":{"login":"%s"}}]]\n' "${GH_REQUESTED_LOGIN:-Copilot}"
               else
                 echo '[[{"event":"committed"},{"event":"review_requested","requested_reviewer":{"login":"alice"}}]]'
               fi
@@ -101,7 +119,7 @@ jobs:
               ;;
           esac
           EOF
-          chmod +x "$STUBS/sleep" "$STUBS/gh"
+          chmod +x "$STUBS/sleep" "$STUBS/date" "$STUBS/gh"
 
       - name: Scenario tests
         run: |
@@ -134,12 +152,20 @@ jobs:
             shift 3
             fixture "$@"
             : > "$REQUEST_LOG"
+            rm -f "$RUNNER_TEMP/sleep-state"
+            local clock=""
+            if [ -n "${CLOCK_START:-}" ]; then
+              clock="$RUNNER_TEMP/fake-clock"
+              echo "$CLOCK_START" > "$clock"
+            fi
             set +e
             PATH="$STUBS:$PATH" GH_FIXTURE="$RUNNER_TEMP/fixture.json" GH_FAIL="${GH_FAIL:-0}" \
               GH_PERMISSIONS_FIXTURE="$RUNNER_TEMP/permissions.json" GH_PERMISSION_FAIL="${GH_PERMISSION_FAIL:-0}" \
               GH_PR_CREATED="${GH_PR_CREATED:-}" GH_TIMELINE_FAIL="${GH_TIMELINE_FAIL:-0}" \
-              GH_COPILOT_REQUESTED="${GH_COPILOT_REQUESTED:-1}" GH_REQUEST_FAIL="${GH_REQUEST_FAIL:-0}" \
-              GH_REQUEST_REASON="${GH_REQUEST_REASON:-}" GH_REQUEST_LOG="$REQUEST_LOG" \
+              GH_COPILOT_REQUESTED="${GH_COPILOT_REQUESTED:-1}" GH_REQUESTED_LOGIN="${GH_REQUESTED_LOGIN:-}" \
+              GH_REQUEST_FAIL="${GH_REQUEST_FAIL:-0}" GH_REQUEST_REASON="${GH_REQUEST_REASON:-}" \
+              GH_REQUEST_LOG="$REQUEST_LOG" SLEEP_POLLS="${SLEEP_POLLS:-}" SLEEP_STATE="$RUNNER_TEMP/sleep-state" \
+              FAKE_CLOCK="$clock" \
               PR_NUMBER="${PR-42}" REPO=t-head/test bash "$gate" > "$RUNNER_TEMP/out.log" 2>&1
             actual=$?
             set -e
@@ -160,6 +186,17 @@ jobs:
               echo "✓ ${1}: ${made} Copilot request(s)"
             else
               echo "::error::✗ ${1}: expected ${2} Copilot request(s), got ${made}"
+              echo "::group::${1} output"; cat "$RUNNER_TEMP/out.log"; echo "::endgroup::"
+              FAILED=1
+            fi
+          }
+
+          # Usage: expect_line <name> <extended regex>; one output line of the previous case must match.
+          expect_line() {
+            if grep -Eq "$2" "$RUNNER_TEMP/out.log"; then
+              echo "✓ ${1}: output line matches"
+            else
+              echo "::error::✗ ${1}: no output line matches ${2}"
               echo "::group::${1} output"; cat "$RUNNER_TEMP/out.log"; echo "::endgroup::"
               FAILED=1
             fi
@@ -216,17 +253,32 @@ jobs:
           expect_requests "fresh PR left to the ruleset" 0
           GH_COPILOT_REQUESTED=0 GH_REQUEST_FAIL=1 run_case $G "read-only token keeps waiting" $WAITING
           expect_requests "read-only token keeps waiting" 1
+          expect_line "read-only token keeps waiting" \
+            '^::warning::Could not call the Copilot review API: .*pull-requests: write'
           GH_COPILOT_REQUESTED=0 GH_REQUEST_REASON=REPOSITORY_INELIGIBLE \
             run_case $G "declined request keeps waiting" $WAITING
           expect_requests "declined request keeps waiting" 1
-          if ! grep -q 'REPOSITORY_INELIGIBLE' "$RUNNER_TEMP/out.log"; then
-            echo "::error::✗ declined request keeps waiting: failure reason missing from the gate output"
-            FAILED=1
-          fi
+          expect_line "declined request keeps waiting" \
+            '^::warning::Copilot declined the review request \(REPOSITORY_INELIGIBLE\)\. Check the organization'
           GH_COPILOT_REQUESTED=0 GH_TIMELINE_FAIL=1 run_case $G "unreadable timeline skips request" $WAITING
           expect_requests "unreadable timeline skips request" 0
           GH_COPILOT_REQUESTED=0 run_case $G "existing Copilot review skips request" $APPROVED "$COPILOT:Bot:COMMENTED"
           expect_requests "existing Copilot review skips request" 0
+          GH_REQUESTED_LOGIN=copilot-helper run_case $G "look-alike reviewer does not count as Copilot" $WAITING
+          expect_requests "look-alike reviewer does not count as Copilot" 1
+          GH_REQUESTED_LOGIN="$COPILOT" run_case $G "bot login counts as Copilot" $WAITING
+          expect_requests "bot login counts as Copilot" 0
+          GH_COPILOT_REQUESTED=0 SLEEP_POLLS=4 run_case $G "request is made once across polls" $WAITING
+          expect_requests "request is made once across polls" 1
+          GH_COPILOT_REQUESTED=0 GH_REQUEST_FAIL=1 SLEEP_POLLS=4 run_case $G "failed request is not retried" $WAITING
+          expect_requests "failed request is not retried" 1
+          # The clock starts 10s after the PR opened and advances 20s per poll: polls 1-3 stay inside the grace.
+          GH_COPILOT_REQUESTED=0 GH_PR_CREATED=2026-01-01T00:00:00Z CLOCK_START=1767225610 SLEEP_POLLS=3 \
+            run_case $G "no request inside the grace period" $WAITING
+          expect_requests "no request inside the grace period" 0
+          GH_COPILOT_REQUESTED=0 GH_PR_CREATED=2026-01-01T00:00:00Z CLOCK_START=1767225610 SLEEP_POLLS=5 \
+            run_case $G "request once the grace period expires" $WAITING
+          expect_requests "request once the grace period expires" 1
           GH_FAIL=1 run_case $G "API failure" $ERROR
           PR="" run_case $G "missing PR context" $ERROR
 

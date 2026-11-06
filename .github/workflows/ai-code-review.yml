@@ -69,18 +69,24 @@ jobs:
                   echo "::warning::Cannot read the PR timeline; skipping the Copilot request fallback."
                 elif [ "$(echo "$TIMELINE_JSON" | jq '[ add // [] | .[]
                       | select(.event == "review_requested"
-                               and ((.requested_reviewer.login // "") | ascii_downcase | startswith("copilot"))) ]
+                               and ((.requested_reviewer.login // "") | ascii_downcase
+                                    | IN("copilot", "copilot-pull-request-reviewer", "copilot-pull-request-reviewer[bot]"))) ]
                       | length')" -eq 0 ]; then
                   echo "  🔁 Copilot was never requested on this PR, requesting it once."
                   # The REST review-request endpoint answers 201 even when Copilot refuses; GraphQL reports why.
                   REQUEST_RESULT=$(gh api graphql -f id="$(echo "$PR_JSON" | jq -r '.node_id')" \
                     -f query='mutation($id: ID!) { requestCopilotCodeReview(input: {pullRequestId: $id}) { success failureReason } }' \
                     2>&1) || true
-                  if [ "$(echo "$REQUEST_RESULT" | jq -r '.data.requestCopilotCodeReview.success // false' 2>/dev/null)" = true ]; then
+                  REQUEST_SUCCESS=$(echo "$REQUEST_RESULT" | jq -r '.data.requestCopilotCodeReview.success // false' 2>/dev/null || true)
+                  REQUEST_REASON=$(echo "$REQUEST_RESULT" | jq -r '.data.requestCopilotCodeReview.failureReason // empty' 2>/dev/null || true)
+                  # Workflow commands end at the first newline, so keep the whole diagnostic on one line.
+                  REQUEST_DETAIL=$(echo "$REQUEST_RESULT" | tr '\n' ' ')
+                  if [ "$REQUEST_SUCCESS" = true ]; then
                     echo "  ✅ Copilot review requested."
+                  elif [ -n "$REQUEST_REASON" ]; then
+                    echo "::warning::Copilot declined the review request (${REQUEST_REASON}). Check the organization's Copilot code review settings, or request Copilot manually."
                   else
-                    REQUEST_REASON=$(echo "$REQUEST_RESULT" | jq -r '.data.requestCopilotCodeReview.failureReason // empty' 2>/dev/null || true)
-                    echo "::warning::Could not request Copilot (${REQUEST_REASON:-${REQUEST_RESULT}}). The caller must grant pull-requests: write and fork PRs are read-only; request Copilot manually."
+                    echo "::warning::Could not call the Copilot review API: ${REQUEST_DETAIL}| The caller must grant pull-requests: write (fork PRs are always read-only); request Copilot manually."
                   fi
                 fi
               fi
