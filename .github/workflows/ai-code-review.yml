@@ -33,24 +33,24 @@ jobs:
           REQUEST_GRACE=60
           REQUEST_CHECKED=0
 
-          echo "🤖 Waiting for Copilot code review on PR #${PR_NUMBER}..."
+          echo "🤖 Waiting for an AI code review (Copilot or Gemini Code Assist) on PR #${PR_NUMBER}..."
           echo ""
 
           while true; do
             REVIEWS_JSON=$(gh api --paginate --slurp \
               "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" | jq 'add // []')
 
-            # Check for Copilot review: user.login matches copilot-pull-request-reviewer[bot] or copilot
-            COPILOT_REVIEW=$(echo "$REVIEWS_JSON" | jq -r '
-              [ .[] | select(.user.login == "copilot-pull-request-reviewer[bot]" or .user.login == "copilot") ]
+            # Exact logins only, so a look-alike account cannot satisfy the gate.
+            AI_REVIEW=$(echo "$REVIEWS_JSON" | jq -r '
+              [ .[] | select(.user.login | IN("copilot-pull-request-reviewer[bot]", "copilot", "gemini-code-assist[bot]")) ]
               | sort_by(.submitted_at) | last // empty
             ')
 
-            if [ -n "$COPILOT_REVIEW" ] && [ "$COPILOT_REVIEW" != "null" ]; then
-              REVIEW_TIME=$(echo "$COPILOT_REVIEW" | jq -r '.submitted_at')
-              REVIEW_STATE=$(echo "$COPILOT_REVIEW" | jq -r '.state')
-              REVIEW_USER=$(echo "$COPILOT_REVIEW" | jq -r '.user.login')
-              echo "✅ Copilot review detected!"
+            if [ -n "$AI_REVIEW" ] && [ "$AI_REVIEW" != "null" ]; then
+              REVIEW_TIME=$(echo "$AI_REVIEW" | jq -r '.submitted_at')
+              REVIEW_STATE=$(echo "$AI_REVIEW" | jq -r '.state')
+              REVIEW_USER=$(echo "$AI_REVIEW" | jq -r '.user.login')
+              echo "✅ AI code review detected!"
               echo "   Reviewer: ${REVIEW_USER}"
               echo "   State: ${REVIEW_STATE}"
               echo "   Submitted at: ${REVIEW_TIME}"
@@ -95,11 +95,11 @@ jobs:
             ELAPSED=$((ELAPSED + POLL_INTERVAL))
             if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
               echo ""
-              echo "::error::⏰ Timeout: Copilot review not detected after ${MAX_WAIT}s."
-              echo "::error::Copilot 尚未提交评审。Copilot 提交评审后会通过 pull_request_review 事件自动重跑此 workflow。"
+              echo "::error::⏰ Timeout: no Copilot or Gemini Code Assist review detected after ${MAX_WAIT}s."
+              echo "::error::A submitted review re-runs this workflow through the pull_request_review event."
               exit 1
             fi
 
-            echo "  ⏳ [${ELAPSED}s/${MAX_WAIT}s] Copilot review not yet available, retrying in ${POLL_INTERVAL}s..."
+            echo "  ⏳ [${ELAPSED}s/${MAX_WAIT}s] AI code review not yet available, retrying in ${POLL_INTERVAL}s..."
             sleep "$POLL_INTERVAL"
           done

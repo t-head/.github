@@ -127,6 +127,7 @@ jobs:
           FAILED=0
           APPROVED=0 WAITING=99 ERROR=1
           COPILOT="copilot-pull-request-reviewer[bot]"
+          GEMINI="gemini-code-assist[bot]"
           REQUEST_LOG="$RUNNER_TEMP/copilot-requests.log"
 
           # Specs are login:type:state[:association[:permission]], defaulting to NONE and write.
@@ -242,6 +243,11 @@ jobs:
           run_case $G "no reviews" $WAITING
           run_case $G "Copilot review" $APPROVED "$COPILOT:Bot:COMMENTED"
           run_case $G "Copilot review on page 2" $APPROVED $(fillers 100) "$COPILOT:Bot:COMMENTED"
+          run_case $G "Gemini Code Assist review" $APPROVED "$GEMINI:Bot:COMMENTED"
+          run_case $G "Gemini Code Assist review on page 2" $APPROVED $(fillers 100) "$GEMINI:Bot:COMMENTED"
+          run_case $G "Gemini look-alike login ignored" $WAITING gemini-code-assist:User:COMMENTED
+          GH_COPILOT_REQUESTED=0 run_case $G "Gemini review skips Copilot request" $APPROVED "$GEMINI:Bot:COMMENTED"
+          expect_requests "Gemini review skips Copilot request" 0
           run_case $G "human reviews only" $WAITING alice:User:APPROVED $(fillers 120)
           run_case $G "other bot ignored" $WAITING other-bot:Bot:COMMENTED
           run_case $G "Copilot already requested" $WAITING
